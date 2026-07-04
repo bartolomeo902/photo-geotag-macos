@@ -8,7 +8,8 @@ DEFAULT_GEO_MAX_EXT_SECS=3600
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
 
 PHOTO_DIR=""
-GPX_FILE=""
+GPX_INPUT=""
+declare -a GPX_FILES=()
 EXTENSIONS="$DEFAULT_EXTENSIONS"
 GEO_MAX_EXT_SECS="$DEFAULT_GEO_MAX_EXT_SECS"
 RECURSIVE=0
@@ -16,22 +17,29 @@ DRY_RUN=0
 PREVIEW=1
 ASSUME_YES=0
 INTERACTIVE=0
+ONLY_UNTAGGED=0
 
 LOG_FILE=""
 TOTAL_FILES=0
 SUCCESS_FILES=0
 FAILED_FILES=0
+PROCESSED_FILES=0
+SKIPPED_ALREADY_GEOTAGGED=0
 
 usage() {
   cat <<'EOF'
 Uso:
-  ./geotag.sh "/path/foto" "/path/track.gpx" [opzioni]
+  ./geotag.sh "/path/foto" "/path/track1.gpx,/path/track2.gpx" [opzioni]
   ./geotag.sh --interactive
 
 Opzioni:
+  --gpx FILE                  Aggiunge un file GPX (opzione ripetibile)
+  --gpx-files LISTA           Lista GPX separati da virgola
   --ext LISTA                Estensioni separate da virgola (default: ARW,DNG,HEIC,heic)
   --recursive                Cerca file in modo ricorsivo
   --geo-max-ext-secs NUM     Valore GeoMaxExtSecs (default: 3600)
+  --only-untagged            Processa solo foto senza metadati GPS
+  --include-already-geotagged Include anche foto già geotaggate
   --dry-run                  Mostra cosa verrebbe eseguito, senza modificare file
   --preview                  Mostra comando prima dell'esecuzione (default)
   --no-preview               Salta preview del comando
@@ -40,7 +48,7 @@ Opzioni:
   --help                     Mostra questo aiuto
 
 Esempio:
-  ./geotag.sh "/path/foto" "/path/track.gpx" --ext ARW,DNG,HEIC --recursive --geo-max-ext-secs 3600
+  ./geotag.sh "/path/foto" --gpx "/path/day1.gpx" --gpx "/path/day2.gpx" --only-untagged --ext ARW,DNG,HEIC --recursive --geo-max-ext-secs 3600
 EOF
 }
 
@@ -86,6 +94,41 @@ validate_number() {
   [[ "$value" =~ ^[0-9]+$ ]]
 }
 
+contains_value() {
+  local seek="$1"
+  shift
+  local item
+  for item in "$@"; do
+    if [[ "$item" == "$seek" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+add_gpx_file() {
+  local raw="$1"
+  local gpx
+  gpx="$(trim "$raw")"
+  [[ -n "$gpx" ]] || return 0
+
+  if ! contains_value "$gpx" "${GPX_FILES[@]-}"; then
+    GPX_FILES+=("$gpx")
+  fi
+}
+
+parse_gpx_input_csv() {
+  local input="$1"
+  local parts=()
+  local part
+
+  [[ -n "$input" ]] || return 0
+  IFS=',' read -r -a parts <<< "$input"
+  for part in "${parts[@]}"; do
+    add_gpx_file "$part"
+  done
+}
+
 init_log() {
   mkdir -p "$LOG_DIR" || die "Impossibile creare la directory log: $LOG_DIR"
   LOG_FILE="$LOG_DIR/geotag_$(date '+%Y%m%d_%H%M%S').log"
@@ -100,19 +143,24 @@ validate_dependencies() {
 }
 
 validate_paths() {
+  local gpx
+
   [[ -n "$PHOTO_DIR" ]] || die "Cartella foto non specificata"
   [[ -d "$PHOTO_DIR" ]] || die "Cartella foto non valida: $PHOTO_DIR"
   [[ -r "$PHOTO_DIR" ]] || die "Cartella foto non leggibile: $PHOTO_DIR"
 
-  [[ -n "$GPX_FILE" ]] || die "File GPX non specificato"
-  [[ -f "$GPX_FILE" ]] || die "File GPX non trovato: $GPX_FILE"
-  [[ -r "$GPX_FILE" ]] || die "File GPX non leggibile: $GPX_FILE"
+  ((${#GPX_FILES[@]} > 0)) || die "Nessun file GPX specificato"
 
-  if command -v xmllint >/dev/null 2>&1; then
-    xmllint --noout "$GPX_FILE" >/dev/null 2>&1 || die "File GPX non valido (XML malformato): $GPX_FILE"
-  elif ! grep -qi '<gpx' "$GPX_FILE"; then
-    die "Impossibile validare GPX con xmllint e tag <gpx> non trovato"
-  fi
+  for gpx in "${GPX_FILES[@]}"; do
+    [[ -f "$gpx" ]] || die "File GPX non trovato: $gpx"
+    [[ -r "$gpx" ]] || die "File GPX non leggibile: $gpx"
+
+    if command -v xmllint >/dev/null 2>&1; then
+      xmllint --noout "$gpx" >/dev/null 2>&1 || die "File GPX non valido (XML malformato): $gpx"
+    elif ! grep -qi '<gpx' "$gpx"; then
+      die "Impossibile validare GPX con xmllint e tag <gpx> non trovato: $gpx"
+    fi
+  done
 }
 
 collect_files() {
@@ -178,34 +226,74 @@ OSA
 }
 
 render_preview() {
+  local gpx
+  local dollar_sign
+  local gps_filter_expr
+  dollar_sign="$(printf '\044')"
+  gps_filter_expr="not ${dollar_sign}GPS:all"
   local base_cmd=(
     exiftool
     -overwrite_original
     -api "GeoMaxExtSecs=${GEO_MAX_EXT_SECS}"
-    -geotag "$GPX_FILE"
-    "<FILE>"
   )
+
+  if [[ "$ONLY_UNTAGGED" -eq 1 ]]; then
+    base_cmd+=( -if "$gps_filter_expr" )
+  fi
+
+  for gpx in "${GPX_FILES[@]}"; do
+    base_cmd+=( -geotag "$gpx" )
+  done
+  base_cmd+=( "<FILE>" )
 
   log "INFO" "Comando base geotag: $(command_to_string "${base_cmd[@]}")"
   log "INFO" "Modalità ricorsiva: $([[ "$RECURSIVE" -eq 1 ]] && printf 'sì' || printf 'no')"
   log "INFO" "Estensioni: $EXTENSIONS"
+  log "INFO" "GPX selezionati: ${#GPX_FILES[@]}"
+  for gpx in "${GPX_FILES[@]}"; do
+    log "INFO" "  - $gpx"
+  done
+  log "INFO" "Solo non geotaggate: $([[ "$ONLY_UNTAGGED" -eq 1 ]] && printf 'sì' || printf 'no')"
   log "INFO" "File trovati: $TOTAL_FILES"
+}
+
+is_already_geotagged() {
+  local file="$1"
+  local dollar_sign
+  local gps_presence_expr
+  dollar_sign="$(printf '\044')"
+  gps_presence_expr="${dollar_sign}GPS:all"
+  local match
+  match="$(exiftool -q -q -s3 -if "$gps_presence_expr" -filename "$file" 2>/dev/null || true)"
+  [[ -n "$match" ]]
 }
 
 run_geotagging() {
   local file
+  local gpx
   local output
   local status
   local cmd
 
   for file in "${FILES[@]}"; do
+    if [[ "$ONLY_UNTAGGED" -eq 1 ]] && is_already_geotagged "$file"; then
+      SKIPPED_ALREADY_GEOTAGGED=$((SKIPPED_ALREADY_GEOTAGGED + 1))
+      log "SKIP" "File già geotaggato, salto: $file"
+      continue
+    fi
+
     cmd=(
       exiftool
       -overwrite_original
       -api "GeoMaxExtSecs=${GEO_MAX_EXT_SECS}"
-      -geotag "$GPX_FILE"
-      "$file"
     )
+
+    for gpx in "${GPX_FILES[@]}"; do
+      cmd+=( -geotag "$gpx" )
+    done
+    cmd+=( "$file" )
+
+    PROCESSED_FILES=$((PROCESSED_FILES + 1))
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
       log "DRYRUN" "$(command_to_string "${cmd[@]}")"
@@ -234,17 +322,35 @@ run_geotagging() {
 show_summary() {
   log "INFO" "Riepilogo finale"
   log "INFO" "Totale file: $TOTAL_FILES"
+  log "INFO" "Da processare (dopo filtri): $PROCESSED_FILES"
+  log "INFO" "Saltati (già geotaggati): $SKIPPED_ALREADY_GEOTAGGED"
   log "INFO" "Successo: $SUCCESS_FILES"
   log "INFO" "Falliti: $FAILED_FILES"
   log "INFO" "Log salvato in: $LOG_FILE"
 }
 
 collect_interactive_inputs() {
+  local selected_gpx_raw
+
   PHOTO_DIR="$(osascript -e 'POSIX path of (choose folder with prompt "Seleziona cartella foto")' 2>/dev/null || true)"
   [[ -n "$PHOTO_DIR" ]] || die "Operazione annullata: cartella foto non selezionata"
 
-  GPX_FILE="$(osascript -e 'POSIX path of (choose file with prompt "Seleziona file GPX")' 2>/dev/null || true)"
-  [[ -n "$GPX_FILE" ]] || die "Operazione annullata: file GPX non selezionato"
+  selected_gpx_raw="$({
+    osascript <<'OSA'
+set selectedFiles to choose file with prompt "Seleziona uno o più file GPX" with multiple selections allowed
+set out to ""
+repeat with f in selectedFiles
+  set out to out & POSIX path of f & linefeed
+end repeat
+return out
+OSA
+  } 2>/dev/null || true)"
+  [[ -n "$selected_gpx_raw" ]] || die "Operazione annullata: nessun file GPX selezionato"
+
+  local gpx_line
+  while IFS= read -r gpx_line; do
+    add_gpx_file "$gpx_line"
+  done <<< "$selected_gpx_raw"
 
   EXTENSIONS="$(osascript -e 'text returned of (display dialog "Estensioni da processare (CSV)" default answer "ARW,DNG,HEIC,heic")' 2>/dev/null || true)"
   [[ -n "$EXTENSIONS" ]] || EXTENSIONS="$DEFAULT_EXTENSIONS"
@@ -263,17 +369,27 @@ collect_interactive_inputs() {
   if [[ "$dry_choice" == *"Sì"* ]]; then
     DRY_RUN=1
   fi
+
+  local only_untagged_choice
+  only_untagged_choice="$(osascript -e 'choose from list {"Sì","No"} with prompt "Geotaggare solo foto non geotaggate?" default items {"Sì"}' 2>/dev/null || true)"
+  if [[ "$only_untagged_choice" == *"Sì"* ]]; then
+    ONLY_UNTAGGED=1
+  fi
 }
 
 parse_args() {
-  if [[ "$#" -ge 2 && "${1#-}" == "$1" && "${2#-}" == "$2" ]]; then
-    PHOTO_DIR="$1"
-    GPX_FILE="$2"
-    shift 2
-  fi
-
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
+      --gpx)
+        [[ "$#" -ge 2 ]] || die "Valore mancante per --gpx"
+        add_gpx_file "$2"
+        shift 2
+        ;;
+      --gpx-files)
+        [[ "$#" -ge 2 ]] || die "Valore mancante per --gpx-files"
+        parse_gpx_input_csv "$2"
+        shift 2
+        ;;
       --ext)
         [[ "$#" -ge 2 ]] || die "Valore mancante per --ext"
         EXTENSIONS="$2"
@@ -287,6 +403,14 @@ parse_args() {
         [[ "$#" -ge 2 ]] || die "Valore mancante per --geo-max-ext-secs"
         GEO_MAX_EXT_SECS="$2"
         shift 2
+        ;;
+      --only-untagged)
+        ONLY_UNTAGGED=1
+        shift
+        ;;
+      --include-already-geotagged)
+        ONLY_UNTAGGED=0
+        shift
         ;;
       --dry-run)
         DRY_RUN=1
@@ -314,12 +438,25 @@ parse_args() {
         exit 0
         ;;
       *)
-        die "Argomento non riconosciuto: $1"
+        if [[ "${1#-}" != "$1" ]]; then
+          die "Argomento non riconosciuto: $1"
+        fi
+
+        if [[ -z "$PHOTO_DIR" ]]; then
+          PHOTO_DIR="$1"
+        elif [[ -z "$GPX_INPUT" ]]; then
+          GPX_INPUT="$1"
+        else
+          die "Argomento posizionale inatteso: $1"
+        fi
+        shift
         ;;
     esac
   done
 
-  if [[ -z "$PHOTO_DIR" || -z "$GPX_FILE" ]]; then
+  parse_gpx_input_csv "$GPX_INPUT"
+
+  if [[ -z "$PHOTO_DIR" || ${#GPX_FILES[@]} -eq 0 ]]; then
     INTERACTIVE=1
   fi
 }
